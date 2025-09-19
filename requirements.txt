@@ -1,4 +1,5 @@
 "fastapi[standard]" 
 uvicorn
-supabase
 dotenv
+boto3
+python-jose
