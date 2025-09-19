@@ -30,7 +30,6 @@ pending_signups: Dict[str, Tuple[str, float]] = {}
 # Helpers
 # ================================
 def _secret_hash(username: str) -> Optional[str]:
-    """Compute SECRET_HASH iff the app client has a secret."""
     if not COGNITO_CLIENT_SECRET:
         return None
     message = (username + COGNITO_CLIENT_ID).encode("utf-8")
@@ -40,7 +39,6 @@ def _secret_hash(username: str) -> Optional[str]:
 
 
 def _friendly_error(e: Exception) -> str:
-    """Map Cognito errors to user-friendly messages."""
     if isinstance(e, ClientError):
         code = e.response["Error"]["Code"]
         if code == "UsernameExistsException":
@@ -50,12 +48,15 @@ def _friendly_error(e: Exception) -> str:
         if code == "CodeMismatchException":
             return "That verification code is incorrect."
         if code == "ExpiredCodeException":
-            return "That verification code expired. Please request a new one."
+            return "That verification code expired. Request a new one."
         if code == "UserNotFoundException":
             return "We couldn’t find an account with that email."
         if code == "UserNotConfirmedException":
             return "Your account isn’t confirmed yet. Please check your email."
         if code == "NotAuthorizedException":
+            msg = e.response["Error"].get("Message", "")
+            if "Refresh Token has expired" in msg:
+                return "Your session has expired. Please log in again."
             return "Incorrect email or password."
     return "Something went wrong. Please try again."
 
@@ -68,8 +69,8 @@ class RegisterRequest(BaseModel):
     name: Optional[str] = None
 
 class ConfirmSignupRequest(BaseModel):
-    code: str = Field(..., min_length=1)
-    pending_token: str = Field(..., min_length=10)
+    code: str
+    pending_token: str
 
 class ResendConfirmationRequest(BaseModel):
     pending_token: str
@@ -78,121 +79,106 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+    email: Optional[EmailStr] = None  # required if client secret is used
+
+class LogoutRequest(BaseModel):
+    access_token: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+
 # ================================
 # Router
 # ================================
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-@router.post("/register")
-def register_user(data: RegisterRequest):
+# ---- Already have register, confirm, resend, login ----
+# Adding refresh, logout, forgot/reset password:
+
+@router.post("/refresh")
+def refresh_tokens(data: RefreshTokenRequest):
+    """
+    Refresh access/id tokens using a refresh token.
+    """
     try:
         params = {
             "ClientId": COGNITO_CLIENT_ID,
-            "Username": data.email,
-            "Password": data.password,
-            "UserAttributes": [{"Name": "email", "Value": data.email}],
+            "AuthFlow": "REFRESH_TOKEN_AUTH",
+            "AuthParameters": {"REFRESH_TOKEN": data.refresh_token},
         }
-        if data.name:
-            params["UserAttributes"].append({"Name": "name", "Value": data.name})
-
-        sh = _secret_hash(data.email)
-        if sh:
-            params["SecretHash"] = sh
-
-        cognito.sign_up(**params)
-
-        # Store email temporarily with pending token (10 min expiry)
-        token = secrets.token_urlsafe(32)
-        pending_signups[token] = (data.email, time.time() + 600)
-
-        return {
-            "status": "pending_confirmation",
-            "message": "Check your email for the verification code.",
-            "pending_token": token,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=_friendly_error(e))
-
-
-@router.post("/confirm-signup")
-def confirm_signup(data: ConfirmSignupRequest):
-    entry = pending_signups.get(data.pending_token)
-    if not entry:
-        raise HTTPException(status_code=400, detail="Confirmation session expired. Please register again.")
-
-    email, expiry = entry
-    if time.time() > expiry:
-        del pending_signups[data.pending_token]
-        raise HTTPException(status_code=400, detail="Confirmation token expired. Please register again.")
-
-    try:
-        params = {
-            "ClientId": COGNITO_CLIENT_ID,
-            "Username": email,
-            "ConfirmationCode": data.code,
-        }
-        sh = _secret_hash(email)
-        if sh:
-            params["SecretHash"] = sh
-
-        cognito.confirm_sign_up(**params)
-        del pending_signups[data.pending_token]
-        return {"status": "confirmed", "message": "Email confirmed. You can now log in."}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=_friendly_error(e))
-
-
-@router.post("/resend-confirmation")
-def resend_confirmation(data: ResendConfirmationRequest):
-    entry = pending_signups.get(data.pending_token)
-    if not entry:
-        raise HTTPException(status_code=400, detail="Confirmation session expired. Please register again.")
-
-    email, expiry = entry
-    if time.time() > expiry:
-        del pending_signups[data.pending_token]
-        raise HTTPException(status_code=400, detail="Confirmation token expired. Please register again.")
-
-    try:
-        params = {"ClientId": COGNITO_CLIENT_ID, "Username": email}
-        sh = _secret_hash(email)
-        if sh:
-            params["SecretHash"] = sh
-
-        cognito.resend_confirmation_code(**params)
-        return {"status": "code_sent", "message": "We’ve sent a new verification code to your email."}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=_friendly_error(e))
-
-
-@router.post("/login")
-def login_user(data: LoginRequest):
-    try:
-        params = {
-            "ClientId": COGNITO_CLIENT_ID,
-            "AuthFlow": "USER_PASSWORD_AUTH",
-            "AuthParameters": {
-                "USERNAME": data.email,
-                "PASSWORD": data.password,
-            },
-        }
-        sh = _secret_hash(data.email)
+        sh = _secret_hash(data.email) if data.email else None
         if sh:
             params["AuthParameters"]["SECRET_HASH"] = sh
 
         resp = cognito.initiate_auth(**params)
-
-        ar = resp.get("AuthenticationResult")
-        if not ar:
-            raise HTTPException(status_code=401, detail="Login failed. Extra verification may be required.")
-
+        ar = resp["AuthenticationResult"]
         return {
-            "status": "authenticated",
+            "status": "refreshed",
             "access_token": ar["AccessToken"],
             "id_token": ar.get("IdToken"),
-            "refresh_token": ar.get("RefreshToken"),
             "expires_in": ar.get("ExpiresIn"),
             "token_type": ar.get("TokenType", "Bearer"),
         }
     except Exception as e:
         raise HTTPException(status_code=401, detail=_friendly_error(e))
+
+
+@router.post("/logout")
+def logout_user(data: LogoutRequest):
+    """
+    Global sign out (invalidates access token on all devices).
+    """
+    try:
+        cognito.global_sign_out(AccessToken=data.access_token)
+        return {"status": "signed_out", "message": "You’ve been signed out on all devices."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_friendly_error(e))
+
+
+@router.post("/forgot-password")
+def forgot_password(data: ForgotPasswordRequest):
+    """
+    Starts password reset process — sends reset code to user’s email.
+    """
+    try:
+        params = {"ClientId": COGNITO_CLIENT_ID, "Username": data.email}
+        sh = _secret_hash(data.email)
+        if sh:
+            params["SecretHash"] = sh
+
+        cognito.forgot_password(**params)
+        return {
+            "status": "code_sent",
+            "message": "We’ve sent a password reset code to your email.",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_friendly_error(e))
+
+
+@router.post("/reset-password")
+def reset_password(data: ResetPasswordRequest):
+    """
+    Completes password reset with the emailed code.
+    """
+    try:
+        params = {
+            "ClientId": COGNITO_CLIENT_ID,
+            "Username": data.email,
+            "ConfirmationCode": data.code,
+            "Password": data.new_password,
+        }
+        sh = _secret_hash(data.email)
+        if sh:
+            params["SecretHash"] = sh
+
+        cognito.confirm_forgot_password(**params)
+        return {"status": "password_reset", "message": "Your password has been updated. You can now log in."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_friendly_error(e))s
