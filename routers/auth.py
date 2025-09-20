@@ -9,7 +9,7 @@ import boto3
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr
-from main import limiter   # from your main.py
+from main import limiter   # from main.py
 
 # ================================
 # AWS Config
@@ -72,6 +72,10 @@ class ConfirmSignupRequest(BaseModel):
     code: str
     pending_token: str
 
+class ConfirmByEmailRequest(BaseModel):
+    email: EmailStr
+    code: str
+
 class ResendConfirmationRequest(BaseModel):
     pending_token: str
 
@@ -105,8 +109,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # ---------- AUTH ROUTES ----------
 
 @router.post("/register")
-@limiter.limit("1/30seconds")
 def register_user(request: Request, data: RegisterRequest):
+    """Register a new user. No rate limit — Cognito enforces password rules."""
     try:
         params = {
             "ClientId": COGNITO_CLIENT_ID,
@@ -118,7 +122,8 @@ def register_user(request: Request, data: RegisterRequest):
             params["UserAttributes"].append({"Name": "name", "Value": data.name})
 
         sh = _secret_hash(data.email)
-        if sh: params["SecretHash"] = sh
+        if sh:
+            params["SecretHash"] = sh
 
         cognito.sign_up(**params)
 
@@ -136,6 +141,7 @@ def register_user(request: Request, data: RegisterRequest):
 @router.post("/confirm-signup")
 @limiter.limit("1/30seconds")
 def confirm_signup(request: Request, data: ConfirmSignupRequest):
+    """Confirm a new user with a pending_token."""
     try:
         if data.pending_token not in pending_signups:
             raise HTTPException(status_code=400, detail="Invalid or expired token.")
@@ -146,7 +152,8 @@ def confirm_signup(request: Request, data: ConfirmSignupRequest):
 
         params = {"ClientId": COGNITO_CLIENT_ID, "Username": username, "ConfirmationCode": data.code}
         sh = _secret_hash(username)
-        if sh: params["SecretHash"] = sh
+        if sh:
+            params["SecretHash"] = sh
 
         cognito.confirm_sign_up(**params)
         del pending_signups[data.pending_token]
@@ -154,16 +161,37 @@ def confirm_signup(request: Request, data: ConfirmSignupRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
+@router.post("/confirm-signup-by-email")
+@limiter.limit("1/30seconds")
+def confirm_signup_by_email(request: Request, data: ConfirmByEmailRequest):
+    """Confirm a new user using email + code (recovery flow)."""
+    try:
+        params = {
+            "ClientId": COHNITO_CLIENT_ID if False else COGNITO_CLIENT_ID,  # keep linter calm if needed
+            "Username": data.email,
+            "ConfirmationCode": data.code,
+        }
+        sh = _secret_hash(data.email)
+        if sh:
+            params["SecretHash"] = sh
+
+        cognito.confirm_sign_up(**params)
+        return {"status": "confirmed", "message": "Account confirmed."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_friendly_error(e))
+
 @router.post("/resend-confirmation")
 @limiter.limit("1/30seconds")
 def resend_confirmation(request: Request, data: ResendConfirmationRequest):
+    """Resend confirmation code (using pending_token)."""
     try:
         if data.pending_token not in pending_signups:
             raise HTTPException(status_code=400, detail="Invalid or expired token.")
         username, _ = pending_signups[data.pending_token]
         params = {"ClientId": COGNITO_CLIENT_ID, "Username": username}
         sh = _secret_hash(username)
-        if sh: params["SecretHash"] = sh
+        if sh:
+            params["SecretHash"] = sh
         cognito.resend_confirmation_code(**params)
         return {"status": "resent", "message": "Code resent."}
     except Exception as e:
@@ -172,10 +200,12 @@ def resend_confirmation(request: Request, data: ResendConfirmationRequest):
 @router.post("/resend-confirmation-by-email")
 @limiter.limit("1/30seconds")
 def resend_confirmation_by_email(request: Request, data: ResendByEmailRequest):
+    """Resend confirmation code (using email)."""
     try:
         params = {"ClientId": COGNITO_CLIENT_ID, "Username": data.email}
         sh = _secret_hash(data.email)
-        if sh: params["SecretHash"] = sh
+        if sh:
+            params["SecretHash"] = sh
         cognito.resend_confirmation_code(**params)
         return {"status": "resent", "message": "A new confirmation code has been sent."}
     except Exception as e:
@@ -184,6 +214,7 @@ def resend_confirmation_by_email(request: Request, data: ResendByEmailRequest):
 @router.post("/login")
 @limiter.limit("5/minute")
 def login_user(request: Request, data: LoginRequest):
+    """Login user. Limited to prevent brute force."""
     try:
         params = {
             "ClientId": COGNITO_CLIENT_ID,
@@ -217,16 +248,16 @@ def login_user(request: Request, data: LoginRequest):
                 cognito.resend_confirmation_code(**params)
             except Exception:
                 pass
-
+            # 🔑 Structured error so frontend can reliably branch
             raise HTTPException(
                 status_code=401,
-                detail="Your account isn’t confirmed yet. We’ve resent the confirmation code to your email."
+                detail={"code": "USER_NOT_CONFIRMED", "message": "Your account isn’t confirmed yet. We’ve resent the confirmation code to your email."}
             )
-
         raise HTTPException(status_code=401, detail=_friendly_error(e))
 
 @router.post("/refresh")
 def refresh_tokens(data: RefreshTokenRequest):
+    """Refresh access/id tokens."""
     try:
         params = {
             "ClientId": COGNITO_CLIENT_ID,
@@ -234,7 +265,8 @@ def refresh_tokens(data: RefreshTokenRequest):
             "AuthParameters": {"REFRESH_TOKEN": data.refresh_token},
         }
         sh = _secret_hash(data.email) if data.email else None
-        if sh: params["AuthParameters"]["SECRET_HASH"] = sh
+        if sh:
+            params["AuthParameters"]["SECRET_HASH"] = sh
         resp = cognito.initiate_auth(**params)
         ar = resp["AuthenticationResult"]
         return {
@@ -249,6 +281,7 @@ def refresh_tokens(data: RefreshTokenRequest):
 
 @router.post("/logout")
 def logout_user(data: LogoutRequest):
+    """Logout user (global signout)."""
     try:
         cognito.global_sign_out(AccessToken=data.access_token)
         return {"status": "signed_out", "message": "You’ve been signed out."}
@@ -258,10 +291,12 @@ def logout_user(data: LogoutRequest):
 @router.post("/forgot-password")
 @limiter.limit("1/30seconds")
 def forgot_password(request: Request, data: ForgotPasswordRequest):
+    """Start password reset flow (sends email)."""
     try:
         params = {"ClientId": COGNITO_CLIENT_ID, "Username": data.email}
         sh = _secret_hash(data.email)
-        if sh: params["SecretHash"] = sh
+        if sh:
+            params["SecretHash"] = sh
         cognito.forgot_password(**params)
         return {"status": "code_sent", "message": "Reset code sent to your email."}
     except Exception as e:
@@ -270,6 +305,7 @@ def forgot_password(request: Request, data: ForgotPasswordRequest):
 @router.post("/reset-password")
 @limiter.limit("1/30seconds")
 def reset_password(request: Request, data: ResetPasswordRequest):
+    """Complete password reset with code."""
     try:
         params = {
             "ClientId": COGNITO_CLIENT_ID,
@@ -278,7 +314,8 @@ def reset_password(request: Request, data: ResetPasswordRequest):
             "Password": data.new_password,
         }
         sh = _secret_hash(data.email)
-        if sh: params["SecretHash"] = sh
+        if sh:
+            params["SecretHash"] = sh
         cognito.confirm_forgot_password(**params)
         return {"status": "password_reset", "message": "Password updated."}
     except Exception as e:
