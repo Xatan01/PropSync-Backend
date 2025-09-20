@@ -7,11 +7,9 @@ import hmac
 from typing import Optional, Dict, Tuple
 import boto3
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from main import limiter   # 👈 import the limiter
+from main import limiter   # from your main.py
 
 # ================================
 # AWS Config
@@ -19,7 +17,7 @@ from main import limiter   # 👈 import the limiter
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID")
 COGNITO_CLIENT_ID = os.getenv("COGNITO_CLIENT_ID")
-COGNITO_CLIENT_SECRET = os.getenv("COGNITO_CLIENT_SECRET")  # optional
+COGNITO_CLIENT_SECRET = os.getenv("COGNITO_CLIENT_SECRET")
 
 if not COGNITO_USER_POOL_ID or not COGNITO_CLIENT_ID:
     raise RuntimeError("Missing Cognito configuration")
@@ -39,7 +37,6 @@ def _secret_hash(username: str) -> Optional[str]:
     key = COGNITO_CLIENT_SECRET.encode("utf-8")
     dig = hmac.new(key, message, hashlib.sha256).digest()
     return base64.b64encode(dig).decode()
-
 
 def _friendly_error(e: Exception) -> str:
     if isinstance(e, ClientError):
@@ -78,13 +75,16 @@ class ConfirmSignupRequest(BaseModel):
 class ResendConfirmationRequest(BaseModel):
     pending_token: str
 
+class ResendByEmailRequest(BaseModel):
+    email: EmailStr
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
-    email: Optional[EmailStr] = None  # required if client secret is used
+    email: Optional[EmailStr] = None
 
 class LogoutRequest(BaseModel):
     access_token: str
@@ -102,11 +102,11 @@ class ResetPasswordRequest(BaseModel):
 # ================================
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# ---------- AUTH ROUTES WITH RATE LIMITING ----------
+# ---------- AUTH ROUTES ----------
 
 @router.post("/register")
-@limiter.limit("1/30seconds")   # ⏳ 1 request every 30s per IP
-def register_user(data: RegisterRequest):
+@limiter.limit("1/30seconds")
+def register_user(request: Request, data: RegisterRequest):
     try:
         params = {
             "ClientId": COGNITO_CLIENT_ID,
@@ -118,10 +118,10 @@ def register_user(data: RegisterRequest):
             params["UserAttributes"].append({"Name": "name", "Value": data.name})
 
         sh = _secret_hash(data.email)
-        if sh:
-            params["SecretHash"] = sh
+        if sh: params["SecretHash"] = sh
 
         cognito.sign_up(**params)
+
         pending_token = secrets.token_urlsafe(32)
         pending_signups[pending_token] = (data.email, time.time())
 
@@ -133,10 +133,9 @@ def register_user(data: RegisterRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
-
 @router.post("/confirm-signup")
 @limiter.limit("1/30seconds")
-def confirm_signup(data: ConfirmSignupRequest):
+def confirm_signup(request: Request, data: ConfirmSignupRequest):
     try:
         if data.pending_token not in pending_signups:
             raise HTTPException(status_code=400, detail="Invalid or expired token.")
@@ -155,10 +154,9 @@ def confirm_signup(data: ConfirmSignupRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
-
 @router.post("/resend-confirmation")
 @limiter.limit("1/30seconds")
-def resend_confirmation(data: ResendConfirmationRequest):
+def resend_confirmation(request: Request, data: ResendConfirmationRequest):
     try:
         if data.pending_token not in pending_signups:
             raise HTTPException(status_code=400, detail="Invalid or expired token.")
@@ -171,10 +169,21 @@ def resend_confirmation(data: ResendConfirmationRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
+@router.post("/resend-confirmation-by-email")
+@limiter.limit("1/30seconds")
+def resend_confirmation_by_email(request: Request, data: ResendByEmailRequest):
+    try:
+        params = {"ClientId": COGNITO_CLIENT_ID, "Username": data.email}
+        sh = _secret_hash(data.email)
+        if sh: params["SecretHash"] = sh
+        cognito.resend_confirmation_code(**params)
+        return {"status": "resent", "message": "A new confirmation code has been sent."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_friendly_error(e))
 
 @router.post("/login")
-@limiter.limit("5/minute")   # allow a few retries
-def login_user(data: LoginRequest):
+@limiter.limit("5/minute")
+def login_user(request: Request, data: LoginRequest):
     try:
         params = {
             "ClientId": COGNITO_CLIENT_ID,
@@ -182,9 +191,12 @@ def login_user(data: LoginRequest):
             "AuthParameters": {"USERNAME": data.email, "PASSWORD": data.password},
         }
         sh = _secret_hash(data.email)
-        if sh: params["AuthParameters"]["SECRET_HASH"] = sh
+        if sh:
+            params["AuthParameters"]["SECRET_HASH"] = sh
+
         resp = cognito.initiate_auth(**params)
         ar = resp["AuthenticationResult"]
+
         return {
             "status": "logged_in",
             "access_token": ar["AccessToken"],
@@ -193,9 +205,25 @@ def login_user(data: LoginRequest):
             "expires_in": ar["ExpiresIn"],
             "token_type": ar.get("TokenType", "Bearer"),
         }
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=_friendly_error(e))
 
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "UserNotConfirmedException":
+            # Auto resend confirmation code
+            try:
+                params = {"ClientId": COGNITO_CLIENT_ID, "Username": data.email}
+                sh = _secret_hash(data.email)
+                if sh:
+                    params["SecretHash"] = sh
+                cognito.resend_confirmation_code(**params)
+            except Exception:
+                pass
+
+            raise HTTPException(
+                status_code=401,
+                detail="Your account isn’t confirmed yet. We’ve resent the confirmation code to your email."
+            )
+
+        raise HTTPException(status_code=401, detail=_friendly_error(e))
 
 @router.post("/refresh")
 def refresh_tokens(data: RefreshTokenRequest):
@@ -219,7 +247,6 @@ def refresh_tokens(data: RefreshTokenRequest):
     except Exception as e:
         raise HTTPException(status_code=401, detail=_friendly_error(e))
 
-
 @router.post("/logout")
 def logout_user(data: LogoutRequest):
     try:
@@ -228,10 +255,9 @@ def logout_user(data: LogoutRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
-
 @router.post("/forgot-password")
 @limiter.limit("1/30seconds")
-def forgot_password(data: ForgotPasswordRequest):
+def forgot_password(request: Request, data: ForgotPasswordRequest):
     try:
         params = {"ClientId": COGNITO_CLIENT_ID, "Username": data.email}
         sh = _secret_hash(data.email)
@@ -241,10 +267,9 @@ def forgot_password(data: ForgotPasswordRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
-
 @router.post("/reset-password")
 @limiter.limit("1/30seconds")
-def reset_password(data: ResetPasswordRequest):
+def reset_password(request: Request, data: ResetPasswordRequest):
     try:
         params = {
             "ClientId": COGNITO_CLIENT_ID,
