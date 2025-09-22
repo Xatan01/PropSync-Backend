@@ -351,3 +351,40 @@ def reset_password(request: Request, data: ResetPasswordRequest):
         return {"status": "password_reset", "message": "Password updated."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly_error(e))
+
+@router.post("/confirm-signup-by-email")
+async def confirm_signup_by_email(data: ConfirmByEmailRequest):
+    try:
+        params = {
+            "ClientId": COGNITO_CLIENT_ID,
+            "Username": data.email,
+            "ConfirmationCode": data.code,
+        }
+        sh = _secret_hash(data.email)
+        if sh:
+            params["SecretHash"] = sh
+
+        cognito.confirm_sign_up(**params)
+
+        # Lookup attributes
+        resp = cognito.admin_get_user(UserPoolId=COGNITO_USER_POOL_ID, Username=data.email)
+        sub, name = None, None
+        for attr in resp["UserAttributes"]:
+            if attr["Name"] == "sub":
+                sub = attr["Value"]
+            if attr["Name"] == "name":
+                name = attr["Value"]
+
+        # Insert into Postgres
+        query = models.agents.insert().values(
+            id=sub,
+            name=name or "",
+            email=data.email,
+            member_since=datetime.datetime.utcnow(),
+            plan="starter",
+        )
+        await database.execute(query)
+
+        return {"status": "confirmed", "message": "Account confirmed."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_friendly_error(e))
