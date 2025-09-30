@@ -1,27 +1,31 @@
-from fastapi import APIRouter, HTTPException
-from propdb.db import database   # ✅ use `database` instead of `propdb`
+from fastapi import APIRouter, Depends
+from propdb.db import database
 from propdb import models
+from utils.auth import get_current_user
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
-# Get all clients
-@router.get("/")
-async def get_clients():
-    query = models.clients.select()
+@router.get("")
+async def list_clients(user=Depends(get_current_user)):
+    # Only return clients for this agent
+    query = models.clients.select().where(models.clients.c.agent_id == user["sub"])
     return await database.fetch_all(query)
 
-# Get one client by ID
-@router.get("/{client_id}")
-async def get_client(client_id: int):
-    query = models.clients.select().where(models.clients.c.id == client_id)
-    client = await database.fetch_one(query)
-    if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
-    return client
-
-# Create a client
-@router.post("/")
-async def create_client(client: dict):
-    query = models.clients.insert().values(**client)
-    client_id = await database.execute(query)
-    return {**client, "id": client_id}
+@router.post("")
+async def create_client(data: dict, user=Depends(get_current_user)):
+    # Add a new client under this agent
+    query = models.clients.insert().values(
+        agent_id=user["sub"],
+        name=data.get("name"),
+        email=data.get("email"),
+        phone=data.get("phone"),
+        property=data.get("property"),
+        transactionType=data.get("transactionType"),
+        status=data.get("status", "pending"),
+        progress=data.get("progress", 0),
+        value=data.get("value", 0),
+        nextTask=data.get("nextTask"),
+        dueDate=data.get("dueDate"),
+    )
+    new_id = await database.execute(query)
+    return {**data, "id": new_id, "agent_id": user["sub"]}

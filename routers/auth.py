@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import datetime
+import traceback
 from typing import Optional, Dict, Tuple
 
 import boto3
@@ -64,7 +65,7 @@ def _friendly_error(e: Exception) -> str:
             if "Refresh Token has expired" in msg:
                 return "Your session has expired. Please log in again."
             return "Incorrect email or password."
-    return "Something went wrong. Please try again."
+    return f"Something went wrong: {str(e)}"
 
 
 # ================================
@@ -153,6 +154,8 @@ def register_user(request: Request, data: RegisterRequest):
             "message": "Please check your email for confirmation code.",
         }
     except Exception as e:
+        print("❌ register_user failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
 
@@ -182,8 +185,7 @@ async def confirm_signup(request: Request, data: ConfirmSignupRequest):
 
         # Step 2: Lookup Cognito user attributes (to get sub + name)
         resp = cognito.admin_get_user(UserPoolId=COGNITO_USER_POOL_ID, Username=username)
-        sub = None
-        name = None
+        sub, name = None, None
         for attr in resp["UserAttributes"]:
             if attr["Name"] == "sub":
                 sub = attr["Value"]
@@ -198,11 +200,19 @@ async def confirm_signup(request: Request, data: ConfirmSignupRequest):
             member_since=datetime.datetime.utcnow(),
             plan="starter",
         )
-        await database.execute(query)
+        try:
+            await database.execute(query)
+        except Exception as db_err:
+            print("❌ DB insert failed (confirm-signup):", db_err)
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Database insert failed: {db_err}")
 
         del pending_signups[data.pending_token]
         return {"status": "confirmed", "message": "Account confirmed."}
+
     except Exception as e:
+        print("❌ confirm-signup failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
 
@@ -221,6 +231,8 @@ def resend_confirmation(request: Request, data: ResendConfirmationRequest):
         cognito.resend_confirmation_code(**params)
         return {"status": "resent", "message": "Code resent."}
     except Exception as e:
+        print("❌ resend_confirmation failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
 
@@ -236,6 +248,8 @@ def resend_confirmation_by_email(request: Request, data: ResendByEmailRequest):
         cognito.resend_confirmation_code(**params)
         return {"status": "resent", "message": "A new confirmation code has been sent."}
     except Exception as e:
+        print("❌ resend_confirmation_by_email failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
 
@@ -281,6 +295,10 @@ def login_user(request: Request, data: LoginRequest):
                 detail="Your account isn’t confirmed yet. We’ve resent the confirmation code to your email.",
             )
         raise HTTPException(status_code=401, detail=_friendly_error(e))
+    except Exception as e:
+        print("❌ login_user failed:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=401, detail=_friendly_error(e))
 
 
 @router.post("/refresh")
@@ -305,6 +323,8 @@ def refresh_tokens(data: RefreshTokenRequest):
             "token_type": ar.get("TokenType", "Bearer"),
         }
     except Exception as e:
+        print("❌ refresh_tokens failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=401, detail=_friendly_error(e))
 
 
@@ -315,6 +335,8 @@ def logout_user(data: LogoutRequest):
         cognito.global_sign_out(AccessToken=data.access_token)
         return {"status": "signed_out", "message": "You’ve been signed out."}
     except Exception as e:
+        print("❌ logout_user failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
 
@@ -330,6 +352,8 @@ def forgot_password(request: Request, data: ForgotPasswordRequest):
         cognito.forgot_password(**params)
         return {"status": "code_sent", "message": "Reset code sent to your email."}
     except Exception as e:
+        print("❌ forgot_password failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=_friendly_error(e))
 
 
@@ -350,7 +374,10 @@ def reset_password(request: Request, data: ResetPasswordRequest):
         cognito.confirm_forgot_password(**params)
         return {"status": "password_reset", "message": "Password updated."}
     except Exception as e:
+        print("❌ reset_password failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=_friendly_error(e))
+
 
 @router.post("/confirm-signup-by-email")
 async def confirm_signup_by_email(data: ConfirmByEmailRequest):
@@ -375,7 +402,7 @@ async def confirm_signup_by_email(data: ConfirmByEmailRequest):
             if attr["Name"] == "name":
                 name = attr["Value"]
 
-        # Insert into Postgres
+        # Insert into Postgres 🔥
         query = models.agents.insert().values(
             id=sub,
             name=name or "",
@@ -383,8 +410,16 @@ async def confirm_signup_by_email(data: ConfirmByEmailRequest):
             member_since=datetime.datetime.utcnow(),
             plan="starter",
         )
-        await database.execute(query)
+        try:
+            await database.execute(query)
+        except Exception as db_err:
+            print("❌ DB insert failed (confirm-signup-by-email):", db_err)
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Database insert failed: {db_err}")
 
         return {"status": "confirmed", "message": "Account confirmed."}
+
     except Exception as e:
+        print("❌ confirm-signup-by-email failed:", e)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=_friendly_error(e))

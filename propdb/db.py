@@ -1,4 +1,4 @@
-# db.py
+# propdb/db.py
 import os
 import databases
 import sqlalchemy
@@ -8,7 +8,7 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-database = databases.Database(DATABASE_URL)   # renamed
+database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
 
 import propdb.models
