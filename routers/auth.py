@@ -31,14 +31,14 @@ class ForgotPasswordRequest(BaseModel):
 def register_user(data: RegisterRequest):
     """Register a new user (agent/client) and send confirmation email."""
     try:
-        # ✅ Include role in user metadata
+        # Create Supabase Auth user
         resp = auth_client.auth.sign_up({
             "email": data.email,
             "password": data.password,
             "options": {
                 "data": {
                     "name": data.name or "",
-                    "role": data.role  # 👈 stored in Supabase user_metadata
+                    "role": data.role
                 },
                 "email_redirect_to": (
                     "http://localhost:5173/dashboard"
@@ -52,14 +52,19 @@ def register_user(data: RegisterRequest):
         if not user:
             raise HTTPException(status_code=400, detail="Registration failed")
 
-        # ✅ Insert into the correct app table
+        # Insert into correct app table
         table_name = "agents" if data.role == "agent" else "clients"
-        admin_client.table(table_name).insert({
+
+        payload = {
             "id": user.id,
             "name": data.name or "",
             "email": data.email,
-            "plan": "starter" if data.role == "agent" else None,
-        }).execute()
+        }
+
+        if data.role == "agent":
+            payload["plan"] = "starter"
+
+        admin_client.table(table_name).insert(payload).execute()
 
         return {
             "status": "pending_confirmation",
@@ -68,6 +73,7 @@ def register_user(data: RegisterRequest):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 
 @router.post("/login")
@@ -127,28 +133,15 @@ def refresh_tokens(data: RefreshTokenRequest):
 
 @router.post("/forgot-password")
 def forgot_password(data: ForgotPasswordRequest):
-    """Trigger Supabase password reset email (safe response)."""
+    """Trigger Supabase password reset email."""
     try:
         auth_client.auth.reset_password_for_email(
             data.email,
-            options={"redirect_to": "http://localhost:5173/reset-password"}
+            options={"redirect_to": "http://localhost:5173/reset-password"},
         )
-
-        # ✅ Always return a neutral message (prevents email enumeration)
-        return {
-            "status": "code_sent",
-            "message": "If this email is registered, you'll receive a reset link shortly."
-        }
-
+        return {"status": "code_sent", "message": "Password reset email sent."}
     except Exception as e:
-        # You can still log internally for debugging if needed
-        print("Forgot password error:", e)
-        # But respond with the same neutral message to the client
-        return {
-            "status": "code_sent",
-            "message": "If this email is registered, you'll receive a reset link shortly."
-        }
-
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/logout")
