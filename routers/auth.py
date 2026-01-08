@@ -29,9 +29,7 @@ class ForgotPasswordRequest(BaseModel):
 
 @router.post("/register")
 def register_user(data: RegisterRequest):
-    """Register a new user (agent/client) and send confirmation email."""
     try:
-        # Create Supabase Auth user
         resp = auth_client.auth.sign_up({
             "email": data.email,
             "password": data.password,
@@ -48,23 +46,8 @@ def register_user(data: RegisterRequest):
             },
         })
 
-        user = resp.user
-        if not user:
+        if not resp.user:
             raise HTTPException(status_code=400, detail="Registration failed")
-
-        # Insert into correct app table
-        table_name = "agents" if data.role == "agent" else "clients"
-
-        payload = {
-            "id": user.id,
-            "name": data.name or "",
-            "email": data.email,
-        }
-
-        if data.role == "agent":
-            payload["plan"] = "starter"
-
-        admin_client.table(table_name).insert(payload).execute()
 
         return {
             "status": "pending_confirmation",
@@ -73,6 +56,7 @@ def register_user(data: RegisterRequest):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 
 

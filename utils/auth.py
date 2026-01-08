@@ -1,19 +1,23 @@
-# utils/auth.py
-from fastapi import Depends, HTTPException
-from fastapi.security import HTTPBearer
-from supabase_client import supabase
+import jwt
+import os
+from fastapi import Header, HTTPException
 
-security = HTTPBearer()
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
 
-def verify_user(token=Depends(security)):
+def get_current_user(authorization: str = Header(...)):
     """
-    Verifies Supabase access_token and returns user info.
-    This replaces the old Cognito get_current_user().
+    Decodes the JWT locally. If the token is expired or fake, 
+    FastAPI blocks the request before it even touches your database logic.
     """
     try:
-        user = supabase.auth.get_user(token.credentials)
-        if not user or not user.user:
-            raise HTTPException(status_code=401, detail="Invalid user session.")
-        return user.user
+        token = authorization.replace("Bearer ", "")
+        payload = jwt.decode(
+            token, 
+            SUPABASE_JWT_SECRET, 
+            algorithms=["HS256"], 
+            audience="authenticated"
+        )
+        # Returns user UUID and metadata safely
+        return payload 
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+        raise HTTPException(status_code=401, detail="Session expired")
