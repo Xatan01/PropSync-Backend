@@ -41,3 +41,14 @@ def create_client(data: Dict[str, Any], user: dict = Depends(get_current_user)):
     }).execute()
 
     return client
+
+@router.get("/activity")
+def list_activities(user: dict = Depends(get_current_user)):
+    res = (
+        admin_client.table("activities")
+        .select("*")
+        .eq("agent_id", user["sub"])
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data or []
