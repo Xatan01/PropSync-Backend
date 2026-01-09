@@ -62,7 +62,6 @@ def register_user(data: RegisterRequest):
 
 @router.post("/login")
 def login_user(data: LoginRequest):
-    """Email-password login (with role check)."""
     try:
         resp = auth_client.auth.sign_in_with_password({
             "email": data.email,
@@ -74,25 +73,25 @@ def login_user(data: LoginRequest):
         if not session or not user:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        # ✅ Role validation
-        user_role = user.user_metadata.get("role") if hasattr(user, "user_metadata") else None
+        user_role = user.user_metadata.get("role")
         if user_role != data.role:
             raise HTTPException(
                 status_code=403,
-                detail=f"This account is a '{user_role or 'unknown'}' account. Please log in via the correct portal."
+                detail=f"This account is a '{user_role or 'unknown'}' account."
             )
 
         return {
             "status": "logged_in",
             "role": user_role,
+            "name": user.user_metadata.get("name"),  # ← THIS WAS MISSING
             "access_token": session.access_token,
             "refresh_token": session.refresh_token,
             "expires_in": session.expires_in,
-            "token_type": "Bearer",
         }
 
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
+
 
 
 @router.post("/refresh")
