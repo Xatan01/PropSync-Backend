@@ -1,23 +1,19 @@
-import jwt
-import os
+# utils/auth.py
 from fastapi import Header, HTTPException
-
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
+from supabase_client import auth_client
 
 def get_current_user(authorization: str = Header(...)):
-    """
-    Decodes the JWT locally. If the token is expired or fake, 
-    FastAPI blocks the request before it even touches your database logic.
-    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+
+    token = authorization.replace("Bearer ", "")
+
     try:
-        token = authorization.replace("Bearer ", "")
-        payload = jwt.decode(
-            token, 
-            SUPABASE_JWT_SECRET, 
-            algorithms=["HS256"], 
-            audience="authenticated"
-        )
-        # Returns user UUID and metadata safely
-        return payload 
+        user = auth_client.auth.get_user(token)
+        return {
+            "sub": user.user.id,
+            "email": user.user.email,
+            "user_metadata": user.user.user_metadata,
+        }
     except Exception:
         raise HTTPException(status_code=401, detail="Session expired")
