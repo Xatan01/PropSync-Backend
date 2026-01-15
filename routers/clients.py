@@ -1,12 +1,27 @@
 # routers/clients.py
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
+from uuid import UUID
+
 from supabase_client import admin_client
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ----------------------------
+# List / Create Clients
+# Support BOTH /clients and /clients/ to avoid 307 redirects
+# ----------------------------
+@router.get("")
 @router.get("/")
 def list_clients(user: dict = Depends(get_current_user)):
     res = (
@@ -18,6 +33,8 @@ def list_clients(user: dict = Depends(get_current_user)):
     )
     return res.data or []
 
+
+@router.post("")
 @router.post("/")
 def create_client(data: Dict[str, Any], user: dict = Depends(get_current_user)):
     new_client = {
@@ -31,17 +48,27 @@ def create_client(data: Dict[str, Any], user: dict = Depends(get_current_user)):
     }
 
     res = admin_client.table("clients").insert(new_client).execute()
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create client")
+
     client = res.data[0]
 
-    admin_client.table("activities").insert({
-        "agent_id": user["sub"],
-        "client_id": client["id"],
-        "action": "created client",
-        "description": f"Added new client {client['name']}"
-    }).execute()
+    admin_client.table("activities").insert(
+        {
+            "agent_id": user["sub"],
+            "client_id": client["id"],
+            "action": "created client",
+            "description": f"Added new client {client['name']}",
+        }
+    ).execute()
 
     return client
 
+
+# ----------------------------
+# Activities
+# IMPORTANT: keep this BEFORE /{client_id} routes
+# ----------------------------
 @router.get("/activity")
 def list_activities(user: dict = Depends(get_current_user)):
     res = (
@@ -52,3 +79,98 @@ def list_activities(user: dict = Depends(get_current_user)):
         .execute()
     )
     return res.data or []
+
+
+# ----------------------------
+# Get single client
+# Use UUID type so invalid ids won't blow up as DB errors
+# ----------------------------
+@router.get("/{client_id}")
+def get_client(client_id: UUID, user: dict = Depends(get_current_user)):
+    res = (
+        admin_client.table("clients")
+        .select("*")
+        .eq("id", str(client_id))
+        .eq("agent_id", user["sub"])
+        .single()
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return res.data
+
+
+# ----------------------------
+# Invite client (create Supabase Auth user + send email)
+# ----------------------------
+@router.post("/invite/{client_id}")
+def invite_client(client_id: UUID, user: dict = Depends(get_current_user)):
+    # 1) verify client belongs to agent
+    client_res = (
+        admin_client.table("clients")
+        .select("*")
+        .eq("id", str(client_id))
+        .eq("agent_id", user["sub"])
+        .single()
+        .execute()
+    )
+    if not client_res.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    client = client_res.data
+    if not client.get("email"):
+        raise HTTPException(status_code=400, detail="Client email is missing")
+
+    email = client["email"]
+    name = client.get("name") or "Client"
+
+    created_user_id = None
+
+    # 2) Prefer "invite_user_by_email" if your supabase-py supports it
+    #    This is the most "email invite link" behavior.
+    try:
+        # Some supabase-py versions expose:
+        # admin_client.auth.admin.invite_user_by_email(email, options={...})
+        invited = admin_client.auth.admin.invite_user_by_email(
+            email,
+            options={
+                "data": {"role": "client", "name": name},
+            },
+        )
+        # invited.user.id exists on some versions
+        created_user_id = getattr(getattr(invited, "user", None), "id", None)
+
+    except Exception:
+        # 3) Fallback: create the user (may not send invite email depending on your Auth email settings)
+        try:
+            created = admin_client.auth.admin.create_user(
+                {
+                    "email": email,
+                    "user_metadata": {"role": "client", "name": name},
+                    "email_confirm": False,
+                }
+            )
+            created_user_id = getattr(getattr(created, "user", None), "id", None)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Invite failed: {str(e)}")
+
+    # 4) Update clients table invite status
+    admin_client.table("clients").update(
+        {
+            "auth_user_id": created_user_id,
+            "invite_status": "pending",
+            "invited_at": utc_now_iso(),
+        }
+    ).eq("id", str(client_id)).execute()
+
+    # 5) Log activity
+    admin_client.table("activities").insert(
+        {
+            "agent_id": user["sub"],
+            "client_id": str(client_id),
+            "action": "sent invite",
+            "description": f"Sent invite to {name} ({email})",
+        }
+    ).execute()
+
+    return {"status": "invited", "auth_user_id": created_user_id}
