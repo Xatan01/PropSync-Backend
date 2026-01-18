@@ -9,6 +9,8 @@ from utils.auth import get_current_user
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
+# Keep in sync with your Supabase redirect allowlist.
+CLIENT_SET_PASSWORD_URL = "http://localhost:5173/client/set-password"
 
 # ----------------------------
 # Helpers
@@ -89,13 +91,60 @@ def list_activities(user: dict = Depends(get_current_user)):
 # ----------------------------
 @router.patch("/{client_id}")
 def update_client(client_id: UUID, data: Dict[str, Any], user: dict = Depends(get_current_user)):
-    allowed_fields = {"name", "email", "phone", "property", "transaction_type", "status", "value"}
+    allowed_fields = {
+        "name",
+        "email",
+        "phone",
+        "property",
+        "transaction_type",
+        "status",
+        "value",
+        "invite_status",
+    }
     updates = {k: v for k, v in data.items() if k in allowed_fields}
     if "transactionType" in data:
         updates["transaction_type"] = data.get("transactionType")
 
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    existing = (
+        admin_client.table("clients")
+        .select("email, auth_user_id")
+        .eq("id", str(client_id))
+        .eq("agent_id", user["sub"])
+        .single()
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    existing_email = (existing.data.get("email") or "").strip().lower()
+    new_email = (updates.get("email") or "").strip().lower()
+    auth_user_id = existing.data.get("auth_user_id")
+    if new_email and new_email != existing_email:
+        if auth_user_id:
+            try:
+                admin_client.auth.admin.update_user_by_id(
+                    auth_user_id,
+                    {"email": new_email, "email_confirm": False},
+                )
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to update auth email: {str(e)}")
+        try:
+            admin_client.auth.reset_password_for_email(
+                new_email,
+                options={"redirect_to": CLIENT_SET_PASSWORD_URL},
+            )
+        except Exception:
+            pass
+        updates.update(
+            {
+                "invite_status": "uninvited",
+                "invited_at": None,
+                "confirmed_at": None,
+            }
+        )
 
     res = (
         admin_client.table("clients")
@@ -119,6 +168,31 @@ def update_client(client_id: UUID, data: Dict[str, Any], user: dict = Depends(ge
     ).execute()
 
     return client
+
+
+@router.delete("/{client_id}")
+def delete_client(client_id: UUID, user: dict = Depends(get_current_user)):
+    res = (
+        admin_client.table("clients")
+        .delete()
+        .eq("id", str(client_id))
+        .eq("agent_id", user["sub"])
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    client = res.data[0]
+    admin_client.table("activities").insert(
+        {
+            "agent_id": user["sub"],
+            "client_id": client["id"],
+            "action": "deleted client",
+            "description": f"Deleted client {client.get('name') or ''}".strip(),
+        }
+    ).execute()
+
+    return {"status": "deleted"}
 
 
 @router.get("/{client_id}")
@@ -170,35 +244,42 @@ def invite_client(client_id: UUID, user: dict = Depends(get_current_user)):
         invited = admin_client.auth.admin.invite_user_by_email(
             email,
             options={
-                "redirect_to": "http://localhost:5173/client/set-password",
+                "redirect_to": CLIENT_SET_PASSWORD_URL,
                 "data": {"role": "client", "name": name},
             },
         )
         # invited.user.id exists on some versions
         created_user_id = getattr(getattr(invited, "user", None), "id", None)
 
-    except Exception:
-        # 3) Fallback: create the user (may not send invite email depending on your Auth email settings)
-        try:
-            created = admin_client.auth.admin.create_user(
+    except Exception as e:
+        msg = str(e)
+        if "already been registered" in msg or "already registered" in msg:
+            admin_client.table("clients").update(
                 {
-                    "email": email,
-                    "user_metadata": {"role": "client", "name": name},
-                    "email_confirm": False,
+                    "invite_status": "pending",
+                    "invited_at": utc_now_iso(),
                 }
-            )
-            created_user_id = getattr(getattr(created, "user", None), "id", None)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Invite failed: {str(e)}")
+            ).eq("id", str(client_id)).execute()
+            try:
+                admin_client.auth.reset_password_for_email(
+                    email,
+                    options={"redirect_to": CLIENT_SET_PASSWORD_URL},
+                )
+            except Exception:
+                pass
+            return {"status": "already_registered"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Invite failed: {msg}")
 
     # 4) Update clients table invite status
-    admin_client.table("clients").update(
-        {
-            "auth_user_id": created_user_id,
-            "invite_status": "pending",
-            "invited_at": utc_now_iso(),
-        }
-    ).eq("id", str(client_id)).execute()
+    update_fields = {
+        "invite_status": "pending",
+        "invited_at": utc_now_iso(),
+    }
+    if created_user_id:
+        update_fields["auth_user_id"] = created_user_id
+
+    admin_client.table("clients").update(update_fields).eq("id", str(client_id)).execute()
 
     # 5) Log activity
     admin_client.table("activities").insert(
