@@ -91,11 +91,13 @@ def get_client_timeline(client_id: str, user: dict = Depends(get_current_user)):
         .select("*")
         .eq("client_id", client_id)
         .eq("agent_id", user["sub"])
-        .single()
+        .limit(1)
         .execute()
     )
     # If none exists, return empty (so frontend opens template picker)
-    return res.data or {"nodes": [], "edges": []}
+    if not res.data:
+        return {"nodes": [], "edges": []}
+    return res.data[0]
 
 
 @router.post("/save/{client_id}")

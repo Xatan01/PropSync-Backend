@@ -41,7 +41,9 @@ def create_client(data: Dict[str, Any], user: dict = Depends(get_current_user)):
         "agent_id": user["sub"],
         "name": data.get("name"),
         "email": data.get("email"),
+        "phone": data.get("phone"),
         "property": data.get("property"),
+        "transaction_type": data.get("transactionType") or data.get("transaction_type"),
         "status": "pending",
         "value": 0,
         "invite_status": "uninvited",
@@ -85,6 +87,40 @@ def list_activities(user: dict = Depends(get_current_user)):
 # Get single client
 # Use UUID type so invalid ids won't blow up as DB errors
 # ----------------------------
+@router.patch("/{client_id}")
+def update_client(client_id: UUID, data: Dict[str, Any], user: dict = Depends(get_current_user)):
+    allowed_fields = {"name", "email", "phone", "property", "transaction_type", "status", "value"}
+    updates = {k: v for k, v in data.items() if k in allowed_fields}
+    if "transactionType" in data:
+        updates["transaction_type"] = data.get("transactionType")
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    res = (
+        admin_client.table("clients")
+        .update(updates)
+        .eq("id", str(client_id))
+        .eq("agent_id", user["sub"])
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    client = res.data[0]
+
+    admin_client.table("activities").insert(
+        {
+            "agent_id": user["sub"],
+            "client_id": client["id"],
+            "action": "updated client",
+            "description": f"Updated client {client.get('name') or ''}".strip(),
+        }
+    ).execute()
+
+    return client
+
+
 @router.get("/{client_id}")
 def get_client(client_id: UUID, user: dict = Depends(get_current_user)):
     res = (
@@ -134,6 +170,7 @@ def invite_client(client_id: UUID, user: dict = Depends(get_current_user)):
         invited = admin_client.auth.admin.invite_user_by_email(
             email,
             options={
+                "redirect_to": "http://localhost:5173/client/set-password",
                 "data": {"role": "client", "name": name},
             },
         )
