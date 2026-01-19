@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from routers.auth import router as auth_router
 from routers.clients import router as clients_router
+from routers.deals import router as deals_router
 from routers.timeline import router as timeline_router
 from routers.subscriptions import router as subscriptions_router
 
@@ -20,6 +21,7 @@ app.add_middleware(
 # 🔥 REGISTER ALL ROUTERS
 app.include_router(auth_router)
 app.include_router(clients_router)
+app.include_router(deals_router)
 app.include_router(timeline_router)
 app.include_router(subscriptions_router)
 
