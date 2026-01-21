@@ -7,6 +7,8 @@ from routers.clients import router as clients_router
 from routers.deals import router as deals_router
 from routers.timeline import router as timeline_router
 from routers.subscriptions import router as subscriptions_router
+from routers.actions import router as actions_router
+from routers.documents import router as documents_router
 
 app = FastAPI(title="PropSync Backend")
 
@@ -24,6 +26,8 @@ app.include_router(clients_router)
 app.include_router(deals_router)
 app.include_router(timeline_router)
 app.include_router(subscriptions_router)
+app.include_router(actions_router)
+app.include_router(documents_router)
 
 @app.get("/")
 def root():
