@@ -6,11 +6,13 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from supabase_client import admin_client
+import os
 from utils.auth import get_current_user
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 BUCKET_NAME = "client-docs"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 
 
 def utc_now_iso() -> str:
@@ -22,6 +24,14 @@ class DocumentRequestPayload(BaseModel):
     description: Optional[str] = None
     required: bool = True
     due_date: Optional[str] = None
+
+
+class DocumentRequestUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    required: Optional[bool] = None
+    due_date: Optional[str] = None
+    status: Optional[str] = None
 
 
 class UploadUrlPayload(BaseModel):
@@ -108,6 +118,92 @@ def create_document_request(
     return res.data[0]
 
 
+@router.patch("/requests/{request_id}")
+def update_document_request(
+    request_id: str, payload: DocumentRequestUpdatePayload, user: dict = Depends(get_current_user)
+):
+    updates = payload.dict(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    res = (
+        admin_client.table("document_requests")
+        .update(updates)
+        .eq("id", request_id)
+        .eq("agent_id", user["sub"])
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    req = res.data[0]
+    admin_client.table("activities").insert(
+        {
+            "agent_id": user["sub"],
+            "client_id": req.get("client_id"),
+            "action": "updated document request",
+            "description": f"Updated request {req.get('title') or ''}".strip(),
+        }
+    ).execute()
+
+    return req
+
+
+@router.delete("/requests/{request_id}")
+def delete_document_request(request_id: str, user: dict = Depends(get_current_user)):
+    req = (
+        admin_client.table("document_requests")
+        .select("id, client_id, title")
+        .eq("id", request_id)
+        .eq("agent_id", user["sub"])
+        .single()
+        .execute()
+    )
+    if not req.data:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    docs_res = (
+        admin_client.table("client_documents")
+        .select("id, storage_path")
+        .eq("request_id", request_id)
+        .eq("agent_id", user["sub"])
+        .execute()
+    )
+    docs = docs_res.data or []
+    storage_paths = [doc.get("storage_path") for doc in docs if doc.get("storage_path")]
+    if storage_paths:
+        try:
+            admin_client.storage.from_(BUCKET_NAME).remove(storage_paths)
+        except Exception:
+            pass
+
+    if docs:
+        admin_client.table("client_documents").delete().eq("request_id", request_id).eq(
+            "agent_id", user["sub"]
+        ).execute()
+
+    res = (
+        admin_client.table("document_requests")
+        .delete()
+        .eq("id", request_id)
+        .eq("agent_id", user["sub"])
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to delete request")
+
+    admin_client.table("activities").insert(
+        {
+            "agent_id": user["sub"],
+            "client_id": req.data.get("client_id"),
+            "action": "deleted document request",
+            "description": f"Deleted request {req.data.get('title') or ''}".strip(),
+        }
+    ).execute()
+
+    return {"status": "deleted", "documents_removed": len(docs)}
+
+
 @router.get("/clients/{client_id}/documents")
 def list_client_documents(client_id: str, user: dict = Depends(get_current_user)):
     ensure_client_owned(client_id, user)
@@ -137,7 +233,12 @@ def create_upload_url(
     if not signed:
         raise HTTPException(status_code=500, detail="Failed to create upload URL")
 
-    return {"storage_path": storage_path, "signed_url": signed.get("signed_url")}
+    signed_url = signed.get("signed_url")
+    if signed_url and not signed_url.startswith("http"):
+        signed_url = signed_url.lstrip("/")
+        signed_url = f"{SUPABASE_URL}/storage/v1/{signed_url}"
+
+    return {"storage_path": storage_path, "signed_url": signed_url}
 
 
 @router.post("/clients/{client_id}/documents/confirm")
@@ -152,12 +253,13 @@ def confirm_upload(
                 "agent_id": user["sub"],
                 "client_id": client_id,
                 "uploader_user_id": user["sub"],
+                "uploader_role": "agent",
                 "file_name": payload.file_name,
                 "storage_path": payload.storage_path,
                 "mime_type": payload.mime_type,
                 "file_size": payload.file_size,
                 "request_id": str(payload.request_id) if payload.request_id else None,
-                "status": "submitted",
+                "status": "shared",
                 "created_at": utc_now_iso(),
             }
         )
@@ -183,12 +285,67 @@ def confirm_upload(
     return res.data[0]
 
 
+@router.delete("/{document_id}")
+def delete_document(document_id: str, user: dict = Depends(get_current_user)):
+    doc = (
+        admin_client.table("client_documents")
+        .select("id, client_id, storage_path, file_name")
+        .eq("id", document_id)
+        .eq("agent_id", user["sub"])
+        .single()
+        .execute()
+    )
+    if not doc.data:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    storage_path = doc.data.get("storage_path")
+    if storage_path:
+        try:
+            admin_client.storage.from_(BUCKET_NAME).remove([storage_path])
+        except Exception:
+            pass
+
+    res = (
+        admin_client.table("client_documents")
+        .delete()
+        .eq("id", document_id)
+        .eq("agent_id", user["sub"])
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to delete document")
+
+    admin_client.table("activities").insert(
+        {
+            "agent_id": user["sub"],
+            "client_id": doc.data.get("client_id"),
+            "action": "deleted document",
+            "description": f"Deleted document {doc.data.get('file_name') or ''}".strip(),
+        }
+    ).execute()
+
+    return {"status": "deleted"}
+
+
 @router.patch("/{document_id}/review")
 def review_document(
     document_id: str, payload: ReviewPayload, user: dict = Depends(get_current_user)
 ):
     if payload.status not in {"approved", "rejected"}:
         raise HTTPException(status_code=400, detail="Invalid status")
+
+    existing = (
+        admin_client.table("client_documents")
+        .select("id,client_id,uploader_role,file_name,request_id")
+        .eq("id", document_id)
+        .eq("agent_id", user["sub"])
+        .single()
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if existing.data.get("uploader_role") != "client":
+        raise HTTPException(status_code=400, detail="Only client uploads can be reviewed")
 
     res = (
         admin_client.table("client_documents")
