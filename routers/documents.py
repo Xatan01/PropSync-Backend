@@ -381,3 +381,34 @@ def review_document(
     ).execute()
 
     return doc
+
+@router.get("/{document_id}/download")
+def download_document(document_id: str, user: dict = Depends(get_current_user)):
+    doc = (
+        admin_client.table("client_documents")
+        .select("id, client_id, storage_path, file_name")
+        .eq("id", document_id)
+        .eq("agent_id", user["sub"])
+        .single()
+        .execute()
+    )
+    if not doc.data:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    storage_path = doc.data.get("storage_path")
+    if not storage_path:
+        raise HTTPException(status_code=400, detail="Document has no storage path")
+
+    signed = admin_client.storage.from_(BUCKET_NAME).create_signed_url(storage_path, 60 * 60)
+    signed_url = None
+    if isinstance(signed, dict):
+        signed_url = signed.get("signed_url") or signed.get("signedURL")
+    if signed_url and not signed_url.startswith("http"):
+        if not SUPABASE_URL:
+            raise HTTPException(status_code=500, detail="SUPABASE_URL not configured")
+        signed_url = f"{SUPABASE_URL}/storage/v1/{signed_url}"
+
+    if not signed_url:
+        raise HTTPException(status_code=500, detail="Failed to create signed download URL")
+
+    return {"signed_url": signed_url, "file_name": doc.data.get("file_name")}
