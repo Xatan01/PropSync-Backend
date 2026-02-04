@@ -1,5 +1,6 @@
 "fastapi[standard]" 
 uvicorn
 dotenv
-boto3
 python-jose
+supabase
+slowapi
