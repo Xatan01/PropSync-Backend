@@ -1,4 +1,5 @@
 # routers/auth.py
+import os
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timezone
@@ -6,6 +7,11 @@ from datetime import datetime, timezone
 from supabase_client import admin_client, auth_client
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+FRONTEND_URL = (os.getenv("FRONTEND_URL") or "http://localhost:5173").rstrip("/")
+AGENT_DASHBOARD_URL = f"{FRONTEND_URL}/dashboard"
+CLIENT_DASHBOARD_URL = f"{FRONTEND_URL}/client-dashboard"
+RESET_PASSWORD_URL = f"{FRONTEND_URL}/reset-password"
 
 
 # -------- Helpers --------
@@ -53,9 +59,7 @@ def register_user(data: RegisterRequest):
                     "data": {"name": data.name or "", "role": data.role},
                     # This is for email confirmation links (sign up flow)
                     "email_redirect_to": (
-                        "http://localhost:5173/dashboard"
-                        if data.role == "agent"
-                        else "http://localhost:5173/client-dashboard"
+                        AGENT_DASHBOARD_URL if data.role == "agent" else CLIENT_DASHBOARD_URL
                     ),
                 },
             }
@@ -131,7 +135,7 @@ def forgot_password(data: ForgotPasswordRequest):
     try:
         auth_client.auth.reset_password_for_email(
             data.email,
-            options={"redirect_to": "http://localhost:5173/reset-password"},
+            options={"redirect_to": RESET_PASSWORD_URL},
         )
         return {"status": "code_sent", "message": "Password reset email sent."}
     except Exception as e:

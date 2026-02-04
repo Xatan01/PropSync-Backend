@@ -1,4 +1,5 @@
 # routers/clients.py
+import os
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict, Any
 from datetime import datetime, timezone
@@ -10,7 +11,8 @@ from utils.auth import get_current_user
 router = APIRouter(prefix="/clients", tags=["clients"])
 
 # Keep in sync with your Supabase redirect allowlist.
-CLIENT_SET_PASSWORD_URL = "http://localhost:5173/client/set-password"
+FRONTEND_URL = (os.getenv("FRONTEND_URL") or "http://localhost:5173").rstrip("/")
+CLIENT_SET_PASSWORD_URL = f"{FRONTEND_URL}/client/set-password"
 
 # ----------------------------
 # Helpers
