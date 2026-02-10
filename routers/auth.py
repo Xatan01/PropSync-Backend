@@ -39,6 +39,7 @@ class RefreshTokenRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+    role: str | None = None
 
 
 class SetPasswordRequest(BaseModel):
@@ -133,9 +134,13 @@ def refresh_tokens(data: RefreshTokenRequest):
 def forgot_password(data: ForgotPasswordRequest):
     """Trigger Supabase password reset email."""
     try:
+        role = (data.role or "agent").strip().lower()
+        if role not in ("agent", "client"):
+            role = "agent"
+        redirect_to = f"{FRONTEND_URL}/reset-password?role={role}"
         auth_client.auth.reset_password_for_email(
             data.email,
-            options={"redirect_to": RESET_PASSWORD_URL},
+            options={"redirect_to": redirect_to},
         )
         return {"status": "code_sent", "message": "Password reset email sent."}
     except Exception as e:
