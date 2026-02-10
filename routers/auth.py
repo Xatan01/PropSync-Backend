@@ -97,6 +97,24 @@ def login_user(data: LoginRequest):
                 detail=f"This account is a '{user_role or 'unknown'}' account.",
             )
 
+        # Mark client as confirmed on successful client login
+        if user_role == "client":
+            try:
+                update_payload = {"invite_status": "confirmed", "confirmed_at": utc_now_iso()}
+                # Prefer auth_user_id match, fallback to email match if missing
+                updated = (
+                    admin_client.table("clients")
+                    .update(update_payload)
+                    .eq("auth_user_id", user.id)
+                    .execute()
+                )
+                if not (updated and updated.data):
+                    admin_client.table("clients").update(update_payload).ilike(
+                        "email", data.email.strip()
+                    ).execute()
+            except Exception:
+                pass
+
         return {
             "status": "logged_in",
             "role": user_role,
